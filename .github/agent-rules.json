@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "issue": {
+    "required_labels": [],
+    "require_assignee": true
+  },
+  "pr": {
+    "required_labels": [],
+    "require_assignee": true,
+    "require_issue_link": true
+  }
+}
