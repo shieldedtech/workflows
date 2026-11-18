@@ -1,20 +1,60 @@
-name: Apply priority from form
+name: Apply priority from form (reusable)
+
+# Reusable workflow: when an issue body contains the form-rendered section
+# `### Priority`, set the org-native Priority issue field (P0..P4 — the
+# source of truth). The board mirror is retired (2026-08): Projects displays
+# the native field directly, so no board write happens here.
+#
+# Accepts both dropdown formats so pre-migration issue bodies keep working:
+#   board-era: "P3 - Medium"        (retired board option names)
+#   legacy:    "priority:p3-medium" (retired label names)
+#   native:    "P3"
+#
+# Requires `secrets.PROJECT_TOKEN` (PAT with `repo` scope) — passed as the
+# step's github-token so every REST call uses it (per-request header
+# overrides do NOT work with github-script's `github` client).
+# Consumer dispatchers trigger on `issues: [opened, edited]`.
 
 on:
-  issues:
-    types: [opened, edited]
-
-permissions:
-  contents: read
-  issues: write
-
-concurrency:
-  group: apply-priority-${{ github.event.issue.number }}
-  cancel-in-progress: true
+  workflow_call:
+    inputs:
+      native_field_id:
+        description: Org-native Priority issue-field id
+        required: false
+        default: '43453170'
+        type: string
+    secrets:
+      PROJECT_TOKEN:
+        description: PAT with `repo` scope (native field write)
+        required: false
 
 jobs:
   apply:
     name: Set native Priority from form dropdown
-    uses: shieldedtech/.github/.github/workflows/apply-priority-from-form.yml@bd9b405ee1f7f86ff67861a4172347faf3c981ec # shieldedtech/.github#40 (native-only)
-    secrets:
-      PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Parse form answer and set native field
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          NATIVE_FIELD_ID: ${{ inputs.native_field_id }}
+        with:
+          github-token: ${{ secrets.PROJECT_TOKEN || github.token }}
+          script: |
+            const body = context.payload.issue.body || '';
+            // Native: "### Priority\n\nP3"; board-era: "P3 - Medium"; legacy: "priority:p3-medium".
+            let native = null;
+            const modern = body.match(/###\s+Priority\s*\n+\s*(P[0-4])(?: - [A-Za-z]+)?\s*$/m);
+            const legacy = body.match(/###\s+Priority\s*\n+\s*priority:p([0-4])-[a-z-]+/);
+            if (modern) native = modern[1];
+            else if (legacy) native = `P${legacy[1]}`;
+            if (!native) { core.info('No Priority dropdown answer found; skipping.'); return; }
+
+            // POST is additive — PUT would wipe the issue's other native field values.
+            await github.request('POST /repos/{owner}/{repo}/issues/{issue_number}/issue-field-values', {
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: context.payload.issue.number,
+              data: [{ field_id: parseInt(process.env.NATIVE_FIELD_ID, 10), value: native }],
+            });
+            core.info(`Native Priority = ${native}`);

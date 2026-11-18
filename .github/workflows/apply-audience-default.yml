@@ -1,24 +1,56 @@
-name: Apply audience default
+name: Apply audience default (reusable)
 
-# Dispatcher — calls the reusable workflow in `shieldedtech/.github`.
-# Defaults `audience:shielded` on issue open when no audience:* label is set.
-# Add-only, idempotent, existence-gated (no-op if the label is absent).
-# Implementation:
-# https://github.com/shieldedtech/.github/blob/main/.github/workflows/apply-audience-default.yml
+# Reusable workflow: on issue open, default `audience:shielded` when the issue
+# has no `audience:*` label yet. Internal-by-default for the SRE fleet, where
+# essentially all work is Shielded-internal; a rare public/partner item is
+# re-labelled by a human (and the gh-compliance backstop catches it). We do NOT
+# guess audience from title/body — the regex would mislabel both ways; shielded
+# is the safe default and the only one without a public-disclosure risk.
+#
+# ADD-ONLY + idempotent: never removes or overrides an existing audience:* label,
+# and only applies the label if it actually exists in the repo (never creates it
+# — labels are IaC-managed). No-op on repos without audience:shielded.
+#
+# Consumer dispatcher triggers on `issues: [opened]` and supplies `issues: write`.
 
 on:
-  issues:
-    types: [opened]
-
-permissions:
-  contents: read
-  issues: write
-
-concurrency:
-  group: apply-audience-${{ github.event.issue.number }}
-  cancel-in-progress: true
+  workflow_call:
 
 jobs:
   apply:
     name: Default audience:shielded on open
-    uses: shieldedtech/.github/.github/workflows/apply-audience-default.yml@70648caf313acd9d28e785e69b5841951f122fa1
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Apply audience:shielded if unset
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const DEFAULT_LABEL = 'audience:shielded';
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issue = context.payload.issue;
+            const issue_number = issue.number;
+
+            // Never override: skip if any audience:* label is already present
+            // (a human or another workflow may have set audience:public etc.).
+            const current = (issue.labels || []).map(l => (typeof l === 'string' ? l : l.name));
+            if (current.some(n => n.startsWith('audience:'))) {
+              core.info(`Issue #${issue_number} already has an audience:* label; nothing to do.`);
+              return;
+            }
+
+            // Existence gate: never create the label (IaC-managed). No-op if absent.
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name: DEFAULT_LABEL });
+            } catch (e) {
+              if (e.status === 404) {
+                core.info(`Label "${DEFAULT_LABEL}" not defined in ${owner}/${repo}; skipping (IaC-managed).`);
+                return;
+              }
+              throw e;
+            }
+
+            await github.rest.issues.addLabels({
+              owner, repo, issue_number, labels: [DEFAULT_LABEL],
+            });
+            core.info(`Applied ${DEFAULT_LABEL} to issue #${issue_number}.`);

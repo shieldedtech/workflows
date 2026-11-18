@@ -1,24 +1,189 @@
-name: Nudge PRs without a linked issue
+name: Nudge PRs without a linked issue (reusable)
 
-# Dispatcher — calls the reusable workflow in `shieldedtech/.github`.
-# On PR open / ready-for-review, if the PR closes no issue, comments once asking
-# for a `Closes #N` link. Never blocks; skips drafts, bot authors, and a
-# `no-issue` opt-out label. Implementation:
-# https://github.com/shieldedtech/.github/blob/main/.github/workflows/nudge-pr-without-issue-link.yml
+# Reusable workflow. On PR open / ready-for-review, when the PR links no issue,
+# post one comment (idempotent via a hidden marker) asking for `Closes #<n>`.
+# Never blocks, never closes. Skips drafts, bot authors and the `no-issue` label.
+#
+# "Links an issue" is defined once, in scripts/issue-refs.mjs. The block between
+# the issue-refs markers below is a generated copy of that file.
+#
+# Consumer dispatcher triggers on `pull_request: [opened, ready_for_review]` and
+# supplies `contents: read` + `pull-requests: write`. Uses `pull_request`, not
+# `pull_request_target`, so it does not run with a write token on fork PRs.
 
 on:
-  pull_request:
-    types: [opened, ready_for_review]
-
-permissions:
-  contents: read
-  pull-requests: write
-
-concurrency:
-  group: nudge-pr-link-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  workflow_call:
 
 jobs:
   nudge:
     name: Nudge PR to link a closing issue
-    uses: shieldedtech/.github/.github/workflows/nudge-pr-without-issue-link.yml@067aae0045afc8fb34740c842b81025ad7d53f42
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Comment once if the PR links no issue
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            // issue-refs: begin (generated from scripts/issue-refs.mjs; edit the source, then run: node scripts/sync-issue-refs.mjs --write)
+            // One definition of "this pull request links an issue", shared by the three PR
+            // reusable workflows. Each workflow carries a generated copy of this file between
+            // the `// issue-refs: begin` and `// issue-refs: end` markers. Edit this file,
+            // then run `node scripts/sync-issue-refs.mjs --write`.
+            //
+            // A link is an issue reference in the PR body after a keyword (`Closes #N`,
+            // `Refs owner/repo#N`, `Fixes <issue URL>`, `Tracks issue #N`, `Tracking: #N`,
+            // `Related to #N`), or an issue in the PR's Development sidebar (GitHub's
+            // closingIssuesReferences).
+            // A reference with no keyword does not count: a bare `#N` names a pull request as
+            // often as an issue, and an `owner/repo#N` or issue URL with no keyword cites an
+            // issue the PR does not work on. The title and the branch name do not count. The
+            // text of a markdown or HTML link belongs to its target URL.
+
+            const MD_LINK_RE = /\[[^[\]]*\]\(([^\s)]+)[^)]*\)/g;
+            const HTML_LINK_RE = /<a\b[^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*>[\s\S]*?<\/a>/gi;
+            const ISSUE_URL = String.raw`https?:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/issues\/(\d+)\b`;
+            const QUALIFIED = String.raw`(?<![\w./-])([\w.-]+)\/([\w.-]+)#(\d+)\b`;
+            const KEYWORD = String.raw`\b(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?|refs?|references?|track(?:s|ed|ing)?(?:\s+(?:issues?|work))?|related\s+(?:to|issues?))\b\s*:?\s*\[?(?:issue\s+)?`;
+            const LINKED_URL_RE = new RegExp(KEYWORD + ISSUE_URL, 'gi');
+            const LINKED_QUALIFIED_RE = new RegExp(KEYWORD + QUALIFIED, 'gi');
+            const CITED_RE = new RegExp(`${ISSUE_URL}|${QUALIFIED}`, 'gi');
+            const BARE_RE = new RegExp(KEYWORD + String.raw`(?<![\w/#&])#(\d+)\b`, 'gi');
+
+            const LOOKUP_ATTEMPTS = 5;
+            const LOOKUP_DELAY_MS = 3000;
+
+            const DEVELOPMENT_LINKS_QUERY = `query($owner:String!,$repo:String!,$number:Int!){
+              repository(owner:$owner,name:$repo){
+                pullRequest(number:$number){
+                  closingIssuesReferences(first:50){ totalCount nodes{ number repository{ name owner{ login } } } }
+                }
+              }
+            }`;
+
+            function addRef(refs, owner, repo, number) {
+              const n = Number(number);
+              const key = `${owner}/${repo}#${n}`.toLowerCase();
+              if (n > 0 && !refs.has(key)) refs.set(key, { owner, repo, number: n });
+            }
+
+            // Issue references written in `text`, each counted only after a keyword. A bare
+            // `#N` belongs to `owner/repo`.
+            function extractIssueRefs(text, owner, repo) {
+              const refs = new Map();
+              let rest = String(text ?? '').replace(MD_LINK_RE, ' $1 ').replace(HTML_LINK_RE, ' $1 ');
+              rest = rest.replace(LINKED_URL_RE, (_match, o, r, n) => { addRef(refs, o, r, n); return ' '; });
+              rest = rest.replace(LINKED_QUALIFIED_RE, (_match, o, r, n) => { addRef(refs, o, r, n); return ' '; });
+              rest = rest.replace(CITED_RE, ' ');
+              rest.replace(BARE_RE, (_match, n) => { addRef(refs, owner, repo, n); return ' '; });
+              return [...refs.values()];
+            }
+
+            // Issues in the PR's Development sidebar: the count, and the ones the token can read.
+            async function developmentLinks(github, owner, repo, number) {
+              let data;
+              try {
+                data = await github.graphql(DEVELOPMENT_LINKS_QUERY, { owner, repo, number });
+              } catch (error) {
+                // The client throws on a response with `errors`; the readable part is on `error.data`.
+                if (!error?.data?.repository?.pullRequest?.closingIssuesReferences) throw error;
+                data = error.data;
+              }
+              const links = data.repository.pullRequest.closingIssuesReferences;
+              return {
+                count: links.totalCount,
+                refs: (links.nodes || []).filter(Boolean).map(node => ({
+                  owner: node.repository.owner.login, repo: node.repository.name, number: node.number,
+                })),
+              };
+            }
+
+            // Union of the body references and the Development links. On `opened`, GitHub
+            // fills the Development links after the event fires, so the lookup retries
+            // while nothing is found. `linked` is true when the PR links at least one
+            // issue; `refs` lists the issues this token could resolve.
+            async function collectIssueRefs({ github, core, owner, repo, number, body, action, wait }) {
+              const sleep = wait || (ms => new Promise(resolve => setTimeout(resolve, ms)));
+              const attempts = action === 'opened' ? LOOKUP_ATTEMPTS : 1;
+              const refs = new Map();
+              for (const ref of extractIssueRefs(body, owner, repo)) addRef(refs, ref.owner, ref.repo, ref.number);
+              const inBody = refs.size;
+              let linkedCount = 0;
+              let lookupFailed = false;
+              for (let attempt = 1; attempt <= attempts; attempt++) {
+                try {
+                  const links = await developmentLinks(github, owner, repo, number);
+                  linkedCount = links.count;
+                  for (const ref of links.refs) addRef(refs, ref.owner, ref.repo, ref.number);
+                } catch (error) {
+                  lookupFailed = true;
+                  core.warning(`closingIssuesReferences lookup failed: ${error.message}`);
+                  break;
+                }
+                if (refs.size > 0 || linkedCount > 0 || attempt === attempts) break;
+                await sleep(LOOKUP_DELAY_MS);
+              }
+              core.info(`PR #${number}: ${inBody} issue reference(s) in the body, ${linkedCount} Development link(s), ${refs.size} distinct issue(s) resolved.`);
+              return { refs: [...refs.values()], linked: refs.size > 0 || linkedCount > 0, lookupFailed };
+            }
+
+            // One `owner repo number` line per issue, for a shell `while read` loop.
+            function formatIssueRefs(refs) {
+              return refs.map(ref => `${ref.owner} ${ref.repo} ${ref.number}`).join('\n');
+            }
+            // issue-refs: end
+
+            const MARKER = '<!-- pr-needs-issue-link -->';
+            // Opt-out label (IaC-managed; honored only if present in the repo).
+            const SKIP_LABEL = 'no-issue';
+
+            const pr = context.payload.pull_request;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const number = pr.number;
+
+            if (pr.draft) {
+              core.info(`PR #${number} is a draft; skipping.`);
+              return;
+            }
+            if (pr.user && pr.user.type === 'Bot') {
+              core.info(`PR #${number} is bot-authored (${pr.user.login}); skipping.`);
+              return;
+            }
+            const labels = (pr.labels || []).map(l => (typeof l === 'string' ? l : l.name));
+            if (labels.includes(SKIP_LABEL)) {
+              core.info(`PR #${number} has '${SKIP_LABEL}'; skipping.`);
+              return;
+            }
+
+            const { linked, lookupFailed } = await collectIssueRefs({
+              github, core, owner, repo, number, body: pr.body, action: context.payload.action,
+            });
+            if (linked) {
+              core.info(`PR #${number} links an issue; nothing to do.`);
+              return;
+            }
+            if (lookupFailed) {
+              core.info(`PR #${number}: Development-link lookup failed; skipping the nudge.`);
+              return;
+            }
+
+            // Never double-comment (re-runs across opened/ready).
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: number, per_page: 100,
+            });
+            if (comments.some(c => (c.body || '').includes(MARKER))) {
+              core.info(`PR #${number} already nudged; nothing to do.`);
+              return;
+            }
+
+            const author = pr.user && pr.user.login ? `@${pr.user.login}` : 'Hi there';
+            const body =
+              `${MARKER}\n` +
+              `${author}, thanks for the PR! I couldn't find an issue reference in the description or the Development sidebar. ` +
+              `Linking one keeps the board accurate.\n\n` +
+              `Add \`Closes #123\` if this PR finishes the issue (\`Fixes\` / \`Resolves\` also work; ` +
+              `on merge the issue moves to Done automatically), \`Refs #123\` if it contributes to a ` +
+              `multi-PR issue, or the \`${SKIP_LABEL}\` label if it genuinely needs no issue ` +
+              `(a chore, revert, or dependency bump). Thanks!`;
+
+            await github.rest.issues.createComment({ owner, repo, issue_number: number, body });
+            core.info(`Nudged PR #${number} to link an issue.`);
