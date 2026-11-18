@@ -1,18 +1,131 @@
-name: Add new issues to SRE board
+name: Add new issues to project (reusable)
+
+# Reusable workflow: when called by a consumer dispatcher on `issues: [opened]`,
+# adds the issue to the named Projects v2 board with `Backlog` status. Default
+# target is the Shielded SRE Board (#50 in the shieldedtech org); consumers can
+# override `project_number` / `project_owner` to add to a different board (e.g.
+# the Midnight Support Project #33).
+#
+# Requires `secrets.PROJECT_TOKEN` to be a PAT (classic) with `project` scope, or
+# a GitHub App installation token with Projects read/write — the default
+# GITHUB_TOKEN cannot write to org-owned ProjectV2 items.
 
 on:
-  issues:
-    types: [opened]
-
-permissions:
-  issues: read
+  workflow_call:
+    inputs:
+      project_number:
+        description: GitHub Projects v2 project number (org-scoped)
+        required: false
+        default: 50
+        type: number
+      project_owner:
+        description: Org login that owns the project
+        required: false
+        default: shieldedtech
+        type: string
+    secrets:
+      PROJECT_TOKEN:
+        description: PAT with `project` scope, or App installation token with Projects write
+        required: false
 
 jobs:
   add-to-project:
-    name: Add issue to Shielded SRE Board (Backlog)
-    uses: shieldedtech/.github/.github/workflows/add-issue-to-project.yml@70648caf313acd9d28e785e69b5841951f122fa1
-    secrets:
-      PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}
-    with:
-      project_number: 50
-      project_owner: shieldedtech
+    name: Add issue to project and set Backlog
+    runs-on: ubuntu-24.04
+    permissions:
+      issues: read
+    steps:
+      - name: Add issue to project and set Backlog
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          ISSUE_NODE_ID: ${{ github.event.issue.node_id }}
+          ORG: ${{ inputs.project_owner }}
+          PROJECT_NUMBER: ${{ inputs.project_number }}
+        run: |
+          set -e
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::warning:: PROJECT_TOKEN secret not set. Add a PAT with 'project' scope to enable auto-add to board."
+            exit 0
+          fi
+
+          # Get project ID and Status field (with Backlog option ID)
+          QUERY='query($org: String!, $number: Int!) {
+            organization(login: $org) {
+              projectV2(number: $number) {
+                id
+                fields(first: 20) {
+                  nodes {
+                    ... on ProjectV2SingleSelectField {
+                      id
+                      name
+                      options {
+                        id
+                        name
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }'
+          RESULT=$(gh api graphql -f query="$QUERY" -f org="$ORG" -F number=$PROJECT_NUMBER 2>&1) || true
+          PROJECT_ID=$(echo "$RESULT" | jq -r '.data.organization.projectV2.id // empty' 2>/dev/null || true)
+          if [[ -z "$PROJECT_ID" ]]; then
+            ERR=$(echo "$RESULT" | jq -r '.errors[0].message // empty' 2>/dev/null || true)
+            echo "::warning:: Could not get project $ORG #$PROJECT_NUMBER. Check PROJECT_TOKEN has project scope."
+            [[ -n "$ERR" ]] && echo "::warning:: API error: $ERR"
+            exit 0
+          fi
+
+          # Find Status field and Backlog option
+          STATUS_FIELD_ID=$(echo "$RESULT" | jq -r '
+            .data.organization.projectV2.fields.nodes[]? |
+            select(.name == "Status") | .id
+          ' 2>/dev/null || true)
+          BACKLOG_OPTION_ID=$(echo "$RESULT" | jq -r '
+            .data.organization.projectV2.fields.nodes[]? |
+            select(.name == "Status") | .options[]? | select(.name == "Backlog") | .id
+          ' 2>/dev/null || true)
+          if [[ -z "$STATUS_FIELD_ID" ]]; then
+            echo "::warning:: Status field not found on project."
+          fi
+          if [[ -z "$BACKLOG_OPTION_ID" ]]; then
+            echo "::warning:: Backlog option not found on Status field. Add a 'Backlog' status in project Customize."
+          fi
+
+          # Add issue to project
+          ADD_MUTATION='mutation($projectId: ID!, $contentId: ID!) {
+            addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) {
+              item { id }
+            }
+          }'
+          ADD_OUTPUT=$(gh api graphql -f query="$ADD_MUTATION" -f projectId="$PROJECT_ID" -f contentId="$ISSUE_NODE_ID" 2>&1) || true
+          ITEM_ID=$(echo "$ADD_OUTPUT" | jq -r '.data.addProjectV2ItemById.item.id // empty' 2>/dev/null || true)
+          if [[ -z "$ITEM_ID" ]]; then
+            ADD_ERR=$(echo "$ADD_OUTPUT" | jq -r '.errors[0].message // empty' 2>/dev/null || true)
+            if [[ -n "$ADD_ERR" ]]; then
+              echo "::warning:: Could not add issue to project. API error: $ADD_ERR"
+            else
+              echo "::warning:: Could not add issue to project (may already be on board)."
+              echo "::warning:: Raw addProjectV2ItemById output: $ADD_OUTPUT"
+            fi
+            exit 0
+          fi
+
+          # Set status to Backlog
+          if [[ -n "$STATUS_FIELD_ID" && -n "$BACKLOG_OPTION_ID" ]]; then
+            UPDATE_MUTATION='mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+              updateProjectV2ItemFieldValue(input: {
+                projectId: $projectId
+                itemId: $itemId
+                fieldId: $fieldId
+                value: { singleSelectOptionId: $optionId }
+              }) { projectV2Item { id } }
+            }'
+            UPDATE_OUTPUT=$(gh api graphql -f query="$UPDATE_MUTATION" \
+              -f projectId="$PROJECT_ID" -f itemId="$ITEM_ID" \
+              -f fieldId="$STATUS_FIELD_ID" -f optionId="$BACKLOG_OPTION_ID" 2>&1) || true
+            UPDATE_ERR=$(echo "$UPDATE_OUTPUT" | jq -r '.errors[0].message // empty' 2>/dev/null || true)
+            [[ -n "$UPDATE_ERR" ]] && echo "::warning:: Could not set Backlog status. API error: $UPDATE_ERR"
+          fi
+          echo "Added issue to project $ORG #$PROJECT_NUMBER with status Backlog."
