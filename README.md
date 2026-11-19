@@ -1,118 +1,79 @@
-# Shielded Technologies Template Repository
+# Shielded Technologies reusable workflows
 
-GitHub template for new Shielded Technologies repositories. Pre-wires the baseline files, security scanning, and contributor policies that every project under [`shieldedtech`](https://github.com/shieldedtech) is expected to have.
+Reusable GitHub Actions workflows for label and lifecycle automation on issues and pull requests in [`shieldedtech`](https://github.com/shieldedtech) repositories.
 
-## What you get
+Each workflow here is triggered with `workflow_call`. A repository uses one by adding a small caller workflow that listens for the event and calls the workflow in this repository.
 
-| File | Purpose |
-| --- | --- |
-| `LICENSE` | Apache-2.0. |
-| `SECURITY.md` | Disclosure policy + private vulnerability reporting flow. |
-| `CONTRIBUTING.md` | Contribution process, DCO, SPDX header template. |
-| `CODE_OF_CONDUCT.md` | Contributor Covenant v2.1. |
-| `CODEOWNERS` | Default review ownership for the meta-files. |
-| `AGENTS.md` | Agent entry point: points at the `shieldedtech/agent-rules` floor, holds local rules. |
-| `CLAUDE.md` | One line, `@AGENTS.md`, so Claude Code loads the same file. |
-| `.github/agent-rules.json` | Machine-checked issue/PR constraints (assignee, labels, issue link). Enforced by the `shielded-core-rules` plugin hook at `gh pr create` / `gh issue create`. |
-| `CHANGELOG.md` | Keep-a-Changelog seed. |
-| `SUPPORT.md` | Splits "I have a question" from "I found a bug". |
-| `NOTICE` | Attribution file (Apache-2.0 convention). |
-| `THIRD_PARTY_NOTICES.md` | Stub for third-party license disclosures. |
-| `.editorconfig` | Indent / line-ending baseline. |
-| `.gitattributes` | LF line endings, binary markers. |
-| `.gitignore` | macOS / Linux / Windows OS junk, common editors, Rust (`target/`), TypeScript/Node (`node_modules/`, `dist/`, `.env*`), Compact `managed/` output. |
-| `.envrc` | Local git config (signed commits). Opt-in via `direnv allow`. |
-| `.github/ISSUE_TEMPLATE/*` | Bug, docs, feature templates + `config.yml`. |
-| `.github/PULL_REQUEST_TEMPLATE/` | PR checklist. |
-| `.github/dependabot.yml` | GitHub Actions updates by default; language ecosystems commented for opt-in. |
-| `.github/release.yml` | Auto-categorized release notes. |
-| `.github/workflows/scan.yaml` | Shared org scan action (`midnightntwrk/upload-sarif-github-action`, SHA-pinned): OpenGrep (SAST) + OSSF Scorecard + Checkov (IaC) + zizmor (Actions) + Trivy (vuln) + gitleaks (secrets) → SARIF to code scanning. CodeQL runs separately via GitHub Default Setup. |
-| `scripts/init-new-repo.sh` | One-shot setup for a new downstream repo (SPDX headers, find/replace). |
-| `docs/adr/` | Architecture Decision Records — `0000-template.md` + index. Copy the template for each new decision. |
+## Workflows
 
-## Using this template
+| Workflow | What it does | Caller trigger | Caller permissions | Secrets |
+| --- | --- | --- | --- | --- |
+| `add-issue-to-project.yml` | Adds a new issue to a Projects v2 board with `Backlog` status. | `issues: [opened]` | `issues: read` | `PROJECT_TOKEN` |
+| `ai-assisted-label.yml` | Applies `bot:ai-assisted` to a pull request whose commits or body carry an AI-tooling signature. | `pull_request` | `contents: read`, `pull-requests: write` | none |
+| `apply-audience-default.yml` | Applies `audience:shielded` to a new issue that has no `audience:*` label. | `issues: [opened]` | `issues: write` | none |
+| `apply-priority-from-form.yml` | Sets the organisation Priority issue field from the `### Priority` section of an issue form. | `issues: [opened, edited]` | `contents: read`, `issues: write` | `PROJECT_TOKEN` |
+| `drop-untriaged-on-assign.yml` | Removes `status:untriaged` from an issue once it has an assignee. | `issues: [assigned, labeled]` | `issues: write` | none |
+| `nudge-pr-without-issue-link.yml` | Comments once on a pull request that links no issue, asking for `Closes #<n>`. Never blocks or closes. | `pull_request: [opened, ready_for_review]` | `contents: read`, `pull-requests: write` | none |
 
-1. Click **Use this template → Create a new repository** in the GitHub UI, or:
+Notes:
 
-   ```bash
-   gh repo create shieldedtech/<your-repo> --template shieldedtech/shielded-template-repo --public
-   ```
+- The workflows never create labels. If the label is missing from the calling repository, the workflow logs that and skips.
+- The pull request workflows use `pull_request`, not `pull_request_target`, so they do not run with a write token on pull requests from forks.
+- `PROJECT_TOKEN` is needed because the default `GITHUB_TOKEN` cannot write to organisation projects or issue fields. The header comment of each workflow states the scope it needs.
 
-2. Clone the new repo and run the init script:
+### Inputs
 
-   ```bash
-   ./scripts/init-new-repo.sh
-   ```
+| Workflow | Input | Default | Purpose |
+| --- | --- | --- | --- |
+| `add-issue-to-project.yml` | `project_number` | `50` | Projects v2 number of the target board. |
+| `add-issue-to-project.yml` | `project_owner` | `shieldedtech` | Organisation that owns the board. |
+| `apply-priority-from-form.yml` | `native_field_id` | `43453170` | Id of the organisation Priority issue field. |
 
-   It will prompt for the repo name, replace `<REPO_NAME>` placeholders, and stage the SPDX header for new files.
-3. Configure repo settings (see [`docs/repo-settings.md`](#repo-settings-checklist) below).
+## Usage
 
-## Repo settings checklist
-
-Set these on every new repo. The template can't enforce them — GitHub settings live outside the working tree.
-
-**Shortcut**: after pushing the first commit to `main`, run the canonical scripts
-from a clone of the (private) governance repo — they are deliberately not vendored
-here, so audited repos can't carry drifted copies:
-
-```bash
-git clone git@github.com:shieldedtech/open-source-governance.git
-./open-source-governance/scripts/apply-ruleset.sh shieldedtech/<your-repo>   # mirror "Base rules"
-./open-source-governance/scripts/audit-repo.sh shieldedtech/<your-repo>      # verify the baseline
-```
-
-Public repos are also re-audited on a schedule by the governance repo's
-re-certification workflow; failures go to the Open Source Committee.
-
-- **Settings → General → Template repository**: ON (only for this template itself).
-- **`Base rules` ruleset on `main`** (what `apply-ruleset.sh` mirrors):
-  - Pull request required: 1 approval, code-owner review, stale-review dismissal,
-    last-push approval, review-thread resolution.
-  - Code scanning (CodeQL) and code-quality gates.
-  - Require signed commits.
-  - Block force-push (`non_fast_forward`) and branch deletion.
-    (No required-status-check, linear-history, or tag rules — add repo-specific
-    required checks, e.g. the DCO App check, separately.)
-- **Settings → Code security**:
-  - Dependabot alerts + security updates: ON.
-  - Secret scanning + push protection: ON.
-  - Private vulnerability reporting: ON.
-- **Actions → General → Workflow permissions**: read-only default; workflows opt-in via `permissions:`.
-- **Rulesets**: disallow tag deletion; require signed tags on `v*`.
-
-## SPDX header
-
-Every source file should carry this header. The init script stages it for you.
-
-```text
-SPDX-FileCopyrightText: Copyright (C) Shielded Technologies
-SPDX-License-Identifier: Apache-2.0
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    https://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-```
-
-Use the comment syntax appropriate to the file format (`//`, `#`, `<!-- -->`, etc.).
-
-## Pinning convention for GitHub Actions
-
-All third-party actions in this template are pinned to a full commit SHA, with the human-readable tag in a trailing comment. Downstream repos must follow the same rule — version tags can be moved; commit SHAs cannot.
+Add a caller workflow to the repository and pin the reference to a full commit SHA:
 
 ```yaml
-- uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+name: Label AI-assisted PRs
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions: {}
+
+jobs:
+  label:
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: shieldedtech/workflows/.github/workflows/ai-assisted-label.yml@<commit-sha>  # pin to a commit SHA
 ```
 
-`dependabot.yml` keeps the SHAs current on a weekly cadence.
+A workflow that needs `PROJECT_TOKEN` takes it from the caller:
 
-## Provenance
+```yaml
+jobs:
+  add-to-project:
+    permissions:
+      issues: read
+    uses: shieldedtech/workflows/.github/workflows/add-issue-to-project.yml@<commit-sha>  # pin to a commit SHA
+    secrets:
+      PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+```
 
-This template started as a fork of [`midnightntwrk/midnight-template-repo`](https://github.com/midnightntwrk/midnight-template-repo) (Apache-2.0). Significant changes: Contributor Covenant v2.1 upgrade, CLA → DCO, the org-maintained `midnightntwrk/upload-sarif-github-action` scan (OpenGrep, OSSF Scorecard, Checkov, zizmor, Trivy, gitleaks) with CodeQL via Default Setup, additional baseline files, and Shielded Technologies branding.
+Reusable workflows without their own `permissions:` block inherit the caller's, so grant only what the table above lists.
+
+## Pinning
+
+Callers pin these workflows, and every third-party action, to a full commit SHA with the version in a trailing comment. Tags can be moved; commit SHAs cannot. Dependabot keeps the pins current.
+
+## Contributing
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md). Commits are signed and signed off for the DCO, and every pull request links an issue. Report vulnerabilities through the process in [`SECURITY.md`](SECURITY.md).
+
+`scan.yaml` is this repository's own security scan and is not a reusable workflow.
+
+## License
+
+Apache-2.0. See [`LICENSE`](LICENSE).
